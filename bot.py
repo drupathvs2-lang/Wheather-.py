@@ -1,45 +1,74 @@
 import os
-import sqlite3
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import sqlite3
+import threading
+import asyncio
+from datetime import time as datetime_time
 
 import requests
+from flask import Flask
 from telegram import (
     Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
 
-# ================= CONFIGURATION =================
+# ==================================================
+# CONFIGURATION
+# ==================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8661663559"))
 
-TIMEZONE = ZoneInfo("Asia/Kolkata")
-DATABASE = "weather_bot.db"
+DEVELOPER = "https://t.me/telgram_boy"
+DB_NAME = "weather_bot.db"
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ================= DATABASE =================
+# ==================================================
+# FLASK WEB SERVER
+# Helps hosting platforms detect an open port.
+# ==================================================
+
+web = Flask(__name__)
+
+
+@web.route("/")
+def home():
+    return "Weather Alert Bot is running!", 200
+
+
+@web.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
+def start_web_server():
+    port = int(os.getenv("PORT", "8080"))
+    web.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# ==================================================
+# DATABASE
+# ==================================================
 
 def db():
-    return sqlite3.connect(DATABASE, timeout=30)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
@@ -48,9 +77,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 first_name TEXT DEFAULT '',
-                latitude REAL,
-                longitude REAL,
-                alerts INTEGER DEFAULT 1,
+                lat REAL,
+                lon REAL,
+                alerts INTEGER DEFAULT 0,
                 alert_time TEXT DEFAULT '07:00'
             )
         """)
@@ -58,570 +87,550 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
-                value TEXT
+                value TEXT DEFAULT ''
             )
         """)
 
-        conn.execute("""
-            INSERT OR IGNORE INTO settings (key, value)
-            VALUES ('start_message',
-            'Welcome to Weather Alert Bot! 🌦️')
-        """)
+        defaults = {
+            "start_message": (
+                "🌦️ Welcome to Weather Alert Bot!\n\n"
+                "Get current weather reports and daily weather alerts."
+            ),
+            "start_photo": "",
+            "alert_time": "07:00",
+        }
 
-
-def register_user(user_id, first_name):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO users (user_id, first_name)
-            VALUES (?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET first_name = excluded.first_name
-        """, (user_id, first_name or ""))
-
-
-def save_location(user_id, lat, lon):
-    with db() as conn:
-        conn.execute("""
-            UPDATE users
-            SET latitude = ?, longitude = ?
-            WHERE user_id = ?
-        """, (lat, lon, user_id))
-
-
-def get_user(user_id):
-    with db() as conn:
-        return conn.execute("""
-            SELECT user_id, first_name, latitude, longitude,
-                   alerts, alert_time
-            FROM users WHERE user_id = ?
-        """, (user_id,)).fetchone()
-
-
-def get_users():
-    with db() as conn:
-        return conn.execute("""
-            SELECT user_id, latitude, longitude,
-                   alerts, alert_time
-            FROM users
-        """).fetchall()
+        for key, value in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
 
 def get_setting(key, default=""):
     with db() as conn:
         row = conn.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            (key,),
+            "SELECT value FROM settings WHERE key = ?", (key,)
         ).fetchone()
-
-    return row[0] if row else default
+        return row["value"] if row else default
 
 
 def set_setting(key, value):
     with db() as conn:
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO settings (key, value)
             VALUES (?, ?)
-            ON CONFLICT(key)
-            DO UPDATE SET value = excluded.value
-        """, (key, value))
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
 
 
-# ================= WEATHER API =================
+def save_user(user_id, first_name):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, first_name)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET first_name=excluded.first_name
+            """,
+            (user_id, first_name),
+        )
+
+
+def save_location(user_id, lat, lon):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, lat, lon)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET lat=excluded.lat, lon=excluded.lon
+            """,
+            (user_id, lat, lon),
+        )
+
+
+# ==================================================
+# WEATHER API
+# Get a free API key from OpenWeather.
+# ==================================================
 
 def get_weather(lat, lon):
-    if not WEATHER_API_KEY:
-        raise RuntimeError("WEATHER_API_KEY is not configured.")
+    if not API_KEY:
+        return None, "Missing API_KEY. Add it to your hosting environment."
 
-    response = requests.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={
-            "lat": lat,
-            "lon": lon,
-            "appid": WEATHER_API_KEY,
-            "units": "metric",
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
-    return response.json()
+    url = "https://api.openweathermap.org/data/2.5/weather"
+
+    try:
+        response = requests.get(
+            url,
+            params={
+                "lat": lat,
+                "lon": lon,
+                "appid": API_KEY,
+                "units": "metric",
+            },
+            timeout=15,
+        )
+
+        if response.status_code != 200:
+            logger.warning("Weather API returned %s", response.status_code)
+            return None, "Weather service unavailable. Check your API key."
+
+        data = response.json()
+
+        weather = {
+            "city": data.get("name", "Your location"),
+            "temperature": data["main"]["temp"],
+            "feels_like": data["main"]["feels_like"],
+            "humidity": data["main"]["humidity"],
+            "description": data["weather"][0]["description"].title(),
+            "wind": data["wind"].get("speed", 0),
+        }
+
+        return weather, None
+
+    except requests.RequestException:
+        logger.exception("Weather API request failed")
+        return None, "Could not connect to the weather service."
 
 
-def get_forecast(lat, lon):
-    response = requests.get(
-        "https://api.openweathermap.org/data/2.5/forecast",
-        params={
-            "lat": lat,
-            "lon": lon,
-            "appid": WEATHER_API_KEY,
-            "units": "metric",
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def format_weather(data):
-    weather = data["weather"][0]
-    main = data["main"]
-    wind = data.get("wind", {})
-
+def format_weather(weather):
     return (
-        f"🌦️ WEATHER REPORT\n\n"
-        f"📍 {data.get('name', 'Your location')}\n"
-        f"🌤️ Condition: {weather['description'].title()}\n"
-        f"🌡️ Temperature: {main['temp']:.1f}°C\n"
-        f"🤗 Feels like: {main['feels_like']:.1f}°C\n"
-        f"💧 Humidity: {main['humidity']}%\n"
-        f"💨 Wind: {wind.get('speed', 0)} m/s\n"
-        f"🔺 High: {main.get('temp_max', 0):.1f}°C\n"
-        f"🔻 Low: {main.get('temp_min', 0):.1f}°C"
+        f"🌤️ WEATHER REPORT\n\n"
+        f"📍 Location: {weather['city']}\n"
+        f"🌡️ Temperature: {weather['temperature']}°C\n"
+        f"🤗 Feels like: {weather['feels_like']}°C\n"
+        f"☁️ Condition: {weather['description']}\n"
+        f"💧 Humidity: {weather['humidity']}%\n"
+        f"💨 Wind speed: {weather['wind']} m/s"
     )
 
 
-# ================= KEYBOARD =================
+# ==================================================
+# KEYBOARDS
+# ==================================================
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
+def main_keyboard(user_id):
+    buttons = [
         [
-            [
-                KeyboardButton("🌦️ Weather"),
-                KeyboardButton("🌧️ Rain Forecast"),
-            ],
-            [
-                KeyboardButton(
-                    "📍 Share Location",
-                    request_location=True,
-                ),
-                KeyboardButton("⏰ Alert Settings"),
-            ],
-            [KeyboardButton("ℹ️ Help")],
+            InlineKeyboardButton("🌤️ Weather", callback_data="weather"),
+            InlineKeyboardButton("🌧️ Alert", callback_data="alert"),
         ],
-        resize_keyboard=True,
-    )
+        [
+            InlineKeyboardButton("👨‍💻 Developer", url=DEVELOPER),
+        ],
+    ]
+
+    if user_id == ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton("👑 Admin Panel", callback_data="admin")
+        ])
+
+    return InlineKeyboardMarkup(buttons)
 
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "📊 Statistics",
-                callback_data="admin_stats",
-            ),
+            InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="broadcast"),
         ],
         [
-            InlineKeyboardButton(
-                "📢 Broadcast",
-                callback_data="admin_broadcast",
-            ),
+            InlineKeyboardButton("✏️ Start Message", callback_data="edit_message"),
+            InlineKeyboardButton("🖼️ Start Photo", callback_data="edit_photo"),
         ],
         [
-            InlineKeyboardButton(
-                "✏️ Change Welcome Message",
-                callback_data="admin_welcome",
-            ),
+            InlineKeyboardButton("⏰ Alert Time", callback_data="edit_time"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Main Menu", callback_data="home"),
         ],
     ])
 
 
-# ================= START =================
+# ==================================================
+# /START COMMAND
+# ==================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user.id, user.first_name)
+    save_user(user.id, user.first_name or "")
 
-    welcome = get_setting(
-        "start_message",
-        "Welcome to Weather Alert Bot! 🌦️",
-    )
+    message = get_setting("start_message")
+    photo = get_setting("start_photo")
+    keyboard = main_keyboard(user.id)
 
-    await update.message.reply_text(
-        f"Hello {user.first_name or 'there'}! 👋\n\n"
-        f"{welcome}\n\n"
-        "Share your location to get local weather updates.",
-        reply_markup=main_keyboard(),
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🌦️ WEATHER BOT HELP\n\n"
-        "/start - Open the bot\n"
-        "/weather - Current weather\n"
-        "/forecast - Rain forecast\n"
-        "/settime 07:00 - Set daily alert time\n"
-        "/alerts_on - Enable daily alerts\n"
-        "/alerts_off - Disable daily alerts\n"
-        "/admin - Admin panel\n\n"
-        "First, share your location.",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ================= LOCATION =================
-
-async def location_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    location = update.message.location
-    user_id = update.effective_user.id
-
-    register_user(user_id, update.effective_user.first_name)
-    save_location(
-        user_id,
-        location.latitude,
-        location.longitude,
-    )
-
-    await update.message.reply_text(
-        "✅ Location saved!\n"
-        "You can now use Weather and Rain Forecast.",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ================= WEATHER =================
-
-async def weather_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user = get_user(update.effective_user.id)
-
-    if not user or user[2] is None or user[3] is None:
-        await update.message.reply_text(
-            "📍 Please share your location first.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    try:
-        data = get_weather(user[2], user[3])
-        await update.message.reply_text(format_weather(data))
-    except Exception:
-        logger.exception("Weather request failed")
-        await update.message.reply_text(
-            "⚠️ Weather service unavailable. Try again later."
-        )
-
-
-async def forecast_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user = get_user(update.effective_user.id)
-
-    if not user or user[2] is None or user[3] is None:
-        await update.message.reply_text(
-            "📍 Please share your location first."
-        )
-        return
-
-    try:
-        data = get_forecast(user[2], user[3])
-        items = data.get("list", [])
-
-        if not items:
-            await update.message.reply_text(
-                "No forecast data is currently available."
+    if photo:
+        try:
+            await update.effective_message.reply_photo(
+                photo=photo,
+                caption=message,
+                reply_markup=keyboard,
             )
             return
+        except Exception:
+            logger.exception("Could not send configured start photo")
 
-        lines = ["🌧️ RAIN FORECAST — NEXT 24 HOURS\n"]
-
-        for item in items[:8]:
-            dt = datetime.fromtimestamp(
-                item["dt"], tz=TIMEZONE
-            )
-            condition = item["weather"][0]["description"].title()
-            rain = item.get("rain", {}).get("3h", 0)
-            pop = int(item.get("pop", 0) * 100)
-
-            lines.append(
-                f"🕒 {dt.strftime('%a %I:%M %p')}\n"
-                f"🌤️ {condition}\n"
-                f"🌧️ Rain probability: {pop}%\n"
-                f"💧 Forecast rain: {rain} mm\n"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception:
-        logger.exception("Forecast request failed")
-        await update.message.reply_text(
-            "⚠️ Could not load the forecast. Try again later."
-        )
-
-
-# ================= ALERT SETTINGS =================
-
-async def settime_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /settime 07:00\n"
-            "Use 24-hour Indian local time."
-        )
-        return
-
-    try:
-        alert_time = context.args[0]
-        datetime.strptime(alert_time, "%H:%M")
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid time. Example: /settime 07:00"
-        )
-        return
-
-    with db() as conn:
-        conn.execute("""
-            UPDATE users SET alert_time = ?
-            WHERE user_id = ?
-        """, (alert_time, update.effective_user.id))
-
-    await update.message.reply_text(
-        f"✅ Daily alert time set to {alert_time} IST."
+    await update.effective_message.reply_text(
+        message,
+        reply_markup=keyboard,
     )
 
 
-async def alerts_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================================================
+# WEATHER AND ALERT FUNCTIONS
+# ==================================================
+
+async def send_weather(update, context):
+    user_id = update.effective_user.id
+
     with db() as conn:
-        conn.execute(
-            "UPDATE users SET alerts = 1 WHERE user_id = ?",
-            (update.effective_user.id,),
+        row = conn.execute(
+            "SELECT lat, lon FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    if not row or row["lat"] is None or row["lon"] is None:
+        context.user_data["waiting_location"] = True
+
+        await update.effective_message.reply_text(
+            "📍 Please share your location using the attachment menu "
+            "in Telegram.\n\n"
+            "Tap 📎 → Location → Send Current Location."
         )
+        return
 
-    await update.message.reply_text("🔔 Daily alerts enabled.")
+    weather, error = await asyncio.to_thread(
+        get_weather, row["lat"], row["lon"]
+    )
+
+    if error:
+        await update.effective_message.reply_text(f"⚠️ {error}")
+        return
+
+    await update.effective_message.reply_text(format_weather(weather))
 
 
-async def alerts_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    location = update.effective_message.location
+    user_id = update.effective_user.id
+
+    save_location(user_id, location.latitude, location.longitude)
+
+    waiting = context.user_data.pop("waiting_location", False)
+
     with db() as conn:
-        conn.execute(
-            "UPDATE users SET alerts = 0 WHERE user_id = ?",
-            (update.effective_user.id,),
-        )
+        row = conn.execute(
+            "SELECT alerts FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
-    await update.message.reply_text("🔕 Daily alerts disabled.")
+        alerts_enabled = bool(row["alerts"]) if row else False
 
-
-# ================= DAILY ALERT JOB =================
-
-async def daily_alert_job(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(TIMEZONE).strftime("%H:%M")
-
-    for user_id, lat, lon, enabled, alert_time in get_users():
-        if not enabled or lat is None or lon is None:
-            continue
-
-        if alert_time != now:
-            continue
-
-        try:
-            weather = get_weather(lat, lon)
-            forecast = get_forecast(lat, lon)
-
-            report = format_weather(weather)
-            items = forecast.get("list", [])[:8]
-
-            rain_expected = any(
-                item.get("pop", 0) >= 0.5
-                or item.get("rain", {}).get("3h", 0) >= 1
-                for item in items
+    if waiting and not alerts_enabled:
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET alerts = 1 WHERE user_id = ?",
+                (user_id,),
             )
 
-            if rain_expected:
-                report += (
-                    "\n\n🌧️ RAIN ALERT!\n"
-                    "Rain may occur in your location "
-                    "during the next 24 hours. "
-                    "Please check the hourly forecast."
-                )
-            else:
-                report += "\n\n🌤️ No strong rain signal in the next 24 hours."
+        await update.effective_message.reply_text(
+            "✅ Location saved!\n"
+            "🌧️ Daily weather alerts are enabled.\n"
+            "⏰ Default alert time: 7:00 AM"
+        )
+
+    weather, error = await asyncio.to_thread(
+        get_weather, location.latitude, location.longitude
+    )
+
+    if error:
+        await update.effective_message.reply_text(f"⚠️ {error}")
+    else:
+        await update.effective_message.reply_text(format_weather(weather))
+
+
+async def daily_weather_alert(context: ContextTypes.DEFAULT_TYPE):
+    with db() as conn:
+        users = conn.execute(
+            """
+            SELECT user_id, lat, lon
+            FROM users
+            WHERE alerts = 1 AND lat IS NOT NULL AND lon IS NOT NULL
+            """
+        ).fetchall()
+
+    for user in users:
+        try:
+            weather, error = await asyncio.to_thread(
+                get_weather, user["lat"], user["lon"]
+            )
+
+            if error:
+                continue
+
+            text = "🌅 DAILY WEATHER ALERT\n\n" + format_weather(weather)
+
+            if "rain" in weather["description"].lower():
+                text += "\n\n🌧️ Rain may be occurring. Please check local conditions."
 
             await context.bot.send_message(
-                chat_id=user_id,
-                text=report,
+                chat_id=user["user_id"],
+                text=text,
             )
 
         except Exception:
-            logger.exception(
-                "Daily alert failed for user %s", user_id
-            )
+            logger.exception("Could not send alert to %s", user["user_id"])
 
 
-# ================= ADMIN =================
+# ==================================================
+# CALLBACK BUTTONS
+# ==================================================
 
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    await update.message.reply_text(
-        "👑 WEATHER BOT ADMIN PANEL",
-        reply_markup=admin_keyboard(),
-    )
-
-
-async def admin_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.from_user.id != ADMIN_ID:
-        await query.edit_message_text("⛔ Admin only.")
-        return
+    user_id = query.from_user.id
+    action = query.data
 
-    if query.data == "admin_stats":
+    if action == "home":
+        await query.message.reply_text(
+            "🌦️ Weather Alert Bot",
+            reply_markup=main_keyboard(user_id),
+        )
+
+    elif action == "weather":
+        await send_weather(update, context)
+
+    elif action == "alert":
+        context.user_data["waiting_location"] = True
+
+        await query.message.reply_text(
+            "🌧️ To enable daily weather alerts, send your current location.\n\n"
+            "📎 Tap Location → Send Current Location."
+        )
+
+    elif action == "admin":
+        if user_id != ADMIN_ID:
+            await query.answer("Not authorized.", show_alert=True)
+            return
+
+        await query.message.reply_text(
+            "👑 ADMIN PANEL",
+            reply_markup=admin_keyboard(),
+        )
+
+    elif action == "stats":
+        if user_id != ADMIN_ID:
+            return
+
         with db() as conn:
-            count = conn.execute(
+            total = conn.execute(
                 "SELECT COUNT(*) FROM users"
             ).fetchone()[0]
 
-            locations = conn.execute("""
-                SELECT COUNT(*) FROM users
-                WHERE latitude IS NOT NULL
-            """).fetchone()[0]
+            alerts = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE alerts = 1"
+            ).fetchone()[0]
 
-        await query.edit_message_text(
+        await query.message.reply_text(
             f"📊 BOT STATISTICS\n\n"
-            f"👥 Total users: {count}\n"
-            f"📍 Users with locations: {locations}"
+            f"👥 Total users: {total}\n"
+            f"🌧️ Active alerts: {alerts}"
         )
 
-    elif query.data == "admin_broadcast":
-        context.user_data["awaiting_broadcast"] = True
-        await query.edit_message_text(
-            "📢 Send the broadcast message as your next message."
+    elif action == "broadcast":
+        if user_id != ADMIN_ID:
+            return
+
+        context.user_data["admin_action"] = "broadcast"
+        await query.message.reply_text(
+            "📢 Send the text you want to broadcast to all bot users."
         )
 
-    elif query.data == "admin_welcome":
-        context.user_data["awaiting_welcome"] = True
-        await query.edit_message_text(
-            "✏️ Send the new welcome message."
+    elif action == "edit_message":
+        if user_id != ADMIN_ID:
+            return
+
+        context.user_data["admin_action"] = "edit_message"
+        await query.message.reply_text("✏️ Send your new start message.")
+
+    elif action == "edit_photo":
+        if user_id != ADMIN_ID:
+            return
+
+        context.user_data["admin_action"] = "edit_photo"
+        await query.message.reply_text(
+            "🖼️ Send the photo you want to use as the start picture."
+        )
+
+    elif action == "edit_time":
+        if user_id != ADMIN_ID:
+            return
+
+        context.user_data["admin_action"] = "edit_time"
+        await query.message.reply_text(
+            "⏰ Send the alert time in 24-hour format, for example 07:00."
         )
 
 
-async def admin_text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+# ==================================================
+# ADMIN TEXT AND PHOTO INPUT
+# ==================================================
+
+async def handle_admin_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    if update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_ID:
         return
 
-    if context.user_data.pop("awaiting_welcome", False):
-        set_setting("start_message", update.message.text)
-        await update.message.reply_text("✅ Welcome message updated.")
+    action = context.user_data.get("admin_action")
+    message = update.effective_message
+
+    if not action:
         return
 
-    if context.user_data.pop("awaiting_broadcast", False):
-        message = update.message.text
-        success = 0
-        failed = 0
+    if action == "edit_message" and message.text:
+        set_setting("start_message", message.text)
+        context.user_data.pop("admin_action", None)
 
-        for user in get_users():
+        await message.reply_text("✅ Start message updated.")
+
+    elif action == "edit_photo" and message.photo:
+        set_setting("start_photo", message.photo[-1].file_id)
+        context.user_data.pop("admin_action", None)
+
+        await message.reply_text("✅ Start photo updated.")
+
+    elif action == "edit_time" and message.text:
+        try:
+            hour, minute = map(int, message.text.strip().split(":"))
+
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+
+            new_time = f"{hour:02d}:{minute:02d}"
+            set_setting("alert_time", new_time)
+
+            # Update all registered users to the selected time.
+            with db() as conn:
+                conn.execute(
+                    "UPDATE users SET alert_time = ?", (new_time,)
+                )
+
+            context.user_data.pop("admin_action", None)
+
+            await message.reply_text(
+                f"✅ Daily alert time updated to {new_time}.\n"
+                "The time uses the hosting server's timezone."
+            )
+
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid time. Please use HH:MM, such as 07:00."
+            )
+
+    elif action == "broadcast" and message.text:
+        context.user_data.pop("admin_action", None)
+
+        with db() as conn:
+            users = conn.execute(
+                "SELECT user_id FROM users"
+            ).fetchall()
+
+        sent = 0
+
+        for row in users:
             try:
                 await context.bot.send_message(
-                    chat_id=user[0],
-                    text=message,
+                    chat_id=row["user_id"],
+                    text=message.text,
                 )
-                success += 1
+                sent += 1
             except Exception:
-                failed += 1
+                logger.warning(
+                    "Broadcast failed for user %s", row["user_id"]
+                )
 
-        await update.message.reply_text(
-            f"📢 Broadcast finished.\n"
-            f"✅ Sent: {success}\n"
-            f"⚠️ Failed: {failed}"
+        await message.reply_text(
+            f"✅ Broadcast finished.\nDelivered: {sent}/{len(users)}"
         )
 
 
-# ================= BUTTON HANDLER =================
+# ==================================================
+# APPLICATION STARTUP
+# ==================================================
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    text = update.message.text
+async def post_init(application: Application):
+    # Keep the scheduler in Asia/Kolkata time.
+    from zoneinfo import ZoneInfo
 
-    if text == "🌦️ Weather":
-        await weather_command(update, context)
+    application.job_queue.scheduler.configure(
+        timezone=ZoneInfo("Asia/Kolkata")
+    )
 
-    elif text == "🌧️ Rain Forecast":
-        await forecast_command(update, context)
+    hour, minute = map(
+        int, get_setting("alert_time", "07:00").split(":")
+    )
 
-    elif text == "⏰ Alert Settings":
-        await update.message.reply_text(
-            "⏰ DAILY ALERT SETTINGS\n\n"
-            "Set time: /settime 07:00\n"
-            "Enable: /alerts_on\n"
-            "Disable: /alerts_off"
-        )
+    application.job_queue.run_daily(
+        daily_weather_alert,
+        time=datetime_time(
+            hour=hour,
+            minute=minute,
+            tzinfo=ZoneInfo("Asia/Kolkata"),
+        ),
+        name="daily_weather_alert",
+    )
 
-    elif text == "ℹ️ Help":
-        await help_command(update, context)
+    logger.info("Weather bot started successfully.")
 
-
-# ================= MAIN =================
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Set the BOT_TOKEN environment variable.")
+        raise RuntimeError("Missing BOT_TOKEN environment variable.")
 
-    if not WEATHER_API_KEY:
-        raise RuntimeError("Set the WEATHER_API_KEY environment variable.")
+    if not API_KEY:
+        logger.warning("API_KEY is missing; weather requests will fail.")
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    threading.Thread(
+        target=start_web_server,
+        daemon=True,
+    ).start()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("weather", weather_command))
-    app.add_handler(CommandHandler("forecast", forecast_command))
-    app.add_handler(CommandHandler("settime", settime_command))
-    app.add_handler(CommandHandler("alerts_on", alerts_on))
-    app.add_handler(CommandHandler("alerts_off", alerts_off))
-    app.add_handler(CommandHandler("admin", admin_command))
-
-    app.add_handler(CallbackQueryHandler(admin_callback))
-    app.add_handler(
-        MessageHandler(filters.LOCATION, location_handler)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
-    app.add_handler(
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        CallbackQueryHandler(buttons)
+    )
+
+    application.add_handler(
+        MessageHandler(filters.LOCATION, handle_location)
+    )
+
+    application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            admin_text_handler,
-        ),
-        group=0,
+            filters.ALL & ~filters.COMMAND,
+            handle_admin_input,
+        )
     )
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            button_handler,
-        ),
-        group=1,
-    )
-
-    app.job_queue.run_repeating(
-        daily_alert_job,
-        interval=60,
-        first=10,
-        name="weather_alerts",
-    )
-
-    logger.info("Weather bot starting...")
-    app.run_polling()
+    application.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
