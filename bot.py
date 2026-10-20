@@ -26,7 +26,7 @@ from telegram.ext import (
 # ==================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEATHER_API_KEY = os.getenv("API_KEY", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8661663559"))
 
 DEVELOPER = "https://t.me/telgram_boy"
