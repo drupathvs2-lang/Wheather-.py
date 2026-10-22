@@ -1,13 +1,17 @@
 services:
-  - type: worker
-    name: telegram-weather-alert-bot
+  - type: web
+    name: telegram-clone-bot
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: WEATHER_API_KEY
+      - key: DATABASE_URL
+        sync: false
+      - key: API_KEY
         sync: false
       - key: ADMIN_ID
         value: "8661663559"
