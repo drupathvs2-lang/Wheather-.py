@@ -1,0 +1,710 @@
+import os
+import asyncio
+import logging
+import threading
+import requests
+import psycopg2
+
+from psycopg2.extras import RealDictCursor
+from flask import Flask
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# ---------------- CONFIGURATION ----------------
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+API_KEY = os.getenv("API_KEY", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8661663559"))
+
+CHANNEL = "@betterbotd"
+CHANNEL_URL = "https://t.me/betterbotd"
+DEVELOPER_URL = f"tg://user?id={ADMIN_ID}"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------- HEALTH SERVER ----------------
+
+web = Flask(__name__)
+
+
+@web.route("/")
+@web.route("/health")
+def health():
+    return "Telegram bot is running!", 200
+
+
+def run_web():
+    port = int(os.getenv("PORT", "10000"))
+    web.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# ---------------- DATABASE ----------------
+
+
+def get_db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10,
+    )
+
+
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    joined_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clones (
+                    id SERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    bot_token TEXT UNIQUE NOT NULL,
+                    bot_username TEXT,
+                    start_message TEXT DEFAULT
+                        'Hello {name}! Welcome to my bot.',
+                    start_photo TEXT,
+                    about_text TEXT DEFAULT 'Welcome to my bot!',
+                    required_channel TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clone_users (
+                    clone_id INTEGER NOT NULL
+                        REFERENCES clones(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
+                    PRIMARY KEY (clone_id, user_id)
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clone_broadcasts (
+                    id SERIAL PRIMARY KEY,
+                    clone_id INTEGER NOT NULL
+                        REFERENCES clones(id) ON DELETE CASCADE,
+                    sent_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+        conn.commit()
+
+
+def save_user(user):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, username)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET username = EXCLUDED.username
+            """, (user.id, user.username))
+        conn.commit()
+
+
+def get_clone(clone_id):
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM clones WHERE id = %s",
+                (clone_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_clone_by_token(token):
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM clones WHERE bot_token = %s",
+                (token,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_owner_clones(owner_id):
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM clones WHERE owner_id = %s ORDER BY id DESC",
+                (owner_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+# ---------------- KEYBOARDS ----------------
+
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌦 Weather", callback_data="weather"),
+            InlineKeyboardButton("🌧 Rain Alert", callback_data="rain"),
+        ],
+        [
+            InlineKeyboardButton(
+                "🤖 Create Your Bot",
+                callback_data="create_clone",
+            ),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ About", callback_data="about"),
+        ],
+    ])
+
+
+def clone_keyboard(clone_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🖼 Set Start Picture",
+                callback_data=f"photo:{clone_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "✏️ Set Start Message",
+                callback_data=f"message:{clone_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "ℹ️ Set About",
+                callback_data=f"aboutedit:{clone_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Statistics",
+                callback_data=f"stats:{clone_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Broadcast",
+                callback_data=f"broadcast:{clone_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data=f"refresh:{clone_id}",
+            ),
+        ],
+    ])
+
+
+# ---------------- MAIN BOT ----------------
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    text = (
+        f"𝓗𝓮𝓵𝓵𝓸 {user.first_name} 👋\n\n"
+        "𝓦𝓮𝓵𝓬𝓸𝓶𝓮 𝓽𝓸 𝓽𝓱𝓮 𝓦𝓮𝓪𝓽𝓱𝓮𝓻 𝓑𝓸𝓽!\n\n"
+        "🌦 Get current weather\n"
+        "🌧 Receive rain alerts\n"
+        "🤖 Create and customize your own bot\n\n"
+        "𝓟𝓸𝔀𝓮𝓻𝓮𝓭 𝓫𝔂 𝓕𝓪𝔁 𝓣𝓖"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        f"<b>My name:</b> Weather Alert Bot\n"
+        f"<b>Developer:</b> Fax TG\n"
+        f"<b>Hosting website:</b> Render"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Owner", url=DEVELOPER_URL)],
+        [InlineKeyboardButton("Back", callback_data="home")],
+    ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+async def check_membership(bot, user_id):
+    try:
+        member = await bot.get_chat_member(CHANNEL, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        logger.exception("Channel membership check failed")
+        return False
+
+
+async def weather_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    if not await check_membership(context.bot, query.from_user.id):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_URL)],
+            [InlineKeyboardButton("✅ Verify", callback_data="verify")],
+        ])
+        await query.message.reply_text(
+            "Please join our channel before using weather features.",
+            reply_markup=keyboard,
+        )
+        return
+
+    await query.message.reply_text(
+        "Send your location using Telegram's attachment menu "
+        "and choose Location."
+    )
+
+
+async def verify_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    if await check_membership(context.bot, query.from_user.id):
+        await query.message.reply_text(
+            "Membership verified! Choose a feature.",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await query.message.reply_text(
+            "I couldn't verify your membership. Join the channel and try again."
+        )
+
+
+async def location_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    location = update.message.location
+    user = update.effective_user
+    save_user(user)
+
+    if not API_KEY:
+        await update.message.reply_text(
+            "Weather API is not configured. Please contact the administrator."
+        )
+        return
+
+    lat, lon = location.latitude, location.longitude
+
+    try:
+        response = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={
+                "lat": lat,
+                "lon": lon,
+                "appid": API_KEY,
+                "units": "metric",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        city = data.get("name", "Your location")
+        temperature = data["main"]["temp"]
+        description = data["weather"][0]["description"]
+
+        await update.message.reply_text(
+            f"🌦 Weather at {city}\n\n"
+            f"🌡 Temperature: {temperature}°C\n"
+            f"☁️ Condition: {description.title()}"
+        )
+
+    except Exception:
+        logger.exception("Weather lookup failed")
+        await update.message.reply_text(
+            "Unable to retrieve weather right now. Please try again later."
+        )
+
+
+async def create_clone(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["awaiting_clone_token"] = True
+
+    await query.message.reply_text(
+        "🤖 <b>Create your own bot</b>\n\n"
+        "1. Open @BotFather in Telegram.\n"
+        "2. Create a bot and copy its token.\n"
+        "3. Send that token here.\n\n"
+        "Only submit a token for a bot you own. "
+        "Your token will be stored privately to run your bot.",
+        parse_mode="HTML",
+    )
+
+
+async def clone_token_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.user_data.get("awaiting_clone_token"):
+        return
+
+    token = update.message.text.strip()
+    context.user_data["awaiting_clone_token"] = False
+
+    # Validate the token with Telegram before saving it.
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=15,
+        )
+        data = response.json()
+
+        if not data.get("ok"):
+            await update.message.reply_text(
+                "❌ Invalid bot token. Please create a bot with @BotFather "
+                "and try again."
+            )
+            return
+
+        bot_info = data["result"]
+        bot_username = bot_info["username"]
+
+    except Exception:
+        await update.message.reply_text(
+            "Could not validate the token. Please try again later."
+        )
+        return
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO clones (owner_id, bot_token, bot_username)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (bot_token) DO NOTHING
+                    RETURNING id
+                """, (update.effective_user.id, token, bot_username))
+
+                row = cur.fetchone()
+                if row is None:
+                    await update.message.reply_text(
+                        "This bot token has already been registered."
+                    )
+                    return
+
+                clone_id = row[0]
+            conn.commit()
+
+        await update.message.reply_text(
+            f"✅ Bot @{bot_username} registered!\n\n"
+            "Open My Clones to configure its start message, picture, "
+            "About section, statistics, and broadcast."
+        )
+
+        await update.message.reply_text(
+            "Your bot is registered, but its polling worker must be started "
+            "by the bot manager. Use /myclones to manage your bot."
+        )
+
+    except Exception:
+        logger.exception("Clone registration failed")
+        await update.message.reply_text(
+            "Could not save your bot. Check the database configuration."
+        )
+
+
+async def myclones(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    clones = get_owner_clones(update.effective_user.id)
+
+    if not clones:
+        await update.message.reply_text(
+            "You haven't created any bots yet. Use /start to create one."
+        )
+        return
+
+    for clone in clones:
+        await update.message.reply_text(
+            f"🤖 @{clone['bot_username']}\n"
+            f"Clone ID: {clone['id']}",
+            reply_markup=clone_keyboard(clone["id"]),
+        )
+
+
+async def clone_settings(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    action = parts[0]
+    clone_id = int(parts[1])
+
+    clone = get_clone(clone_id)
+
+    if not clone or clone["owner_id"] != query.from_user.id:
+        await query.message.reply_text(
+            "You can only manage bots that you own."
+        )
+        return
+
+    if action == "photo":
+        context.user_data["editing_clone"] = clone_id
+        context.user_data["edit_action"] = "photo"
+        await query.message.reply_text(
+            "Send the picture you want to use as your bot's start picture."
+        )
+
+    elif action == "message":
+        context.user_data["editing_clone"] = clone_id
+        context.user_data["edit_action"] = "message"
+        await query.message.reply_text(
+            "Send the new start message. You can use {name} for the user's name."
+        )
+
+    elif action == "aboutedit":
+        context.user_data["editing_clone"] = clone_id
+        context.user_data["edit_action"] = "about"
+        await query.message.reply_text("Send your new About text.")
+
+    elif action == "stats":
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM clone_users WHERE clone_id = %s",
+                    (clone_id,),
+                )
+                users = cur.fetchone()[0]
+
+                cur.execute(
+                    "SELECT COUNT(*) FROM clone_broadcasts WHERE clone_id = %s",
+                    (clone_id,),
+                )
+                broadcasts = cur.fetchone()[0]
+
+        await query.message.reply_text(
+            f"📊 Statistics for @{clone['bot_username']}\n\n"
+            f"Users: {users}\n"
+            f"Broadcasts: {broadcasts}"
+        )
+
+    elif action == "broadcast":
+        context.user_data["editing_clone"] = clone_id
+        context.user_data["edit_action"] = "broadcast"
+        await query.message.reply_text(
+            "Send the text you want to broadcast to your clone's users."
+        )
+
+    elif action == "refresh":
+        await query.message.reply_text(
+            f"Settings for @{clone['bot_username']}",
+            reply_markup=clone_keyboard(clone_id),
+        )
+
+
+async def edit_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    action = context.user_data.get("edit_action")
+    clone_id = context.user_data.get("editing_clone")
+
+    if not action or not clone_id:
+        return
+
+    clone = get_clone(clone_id)
+
+    if not clone or clone["owner_id"] != update.effective_user.id:
+        context.user_data.pop("edit_action", None)
+        context.user_data.pop("editing_clone", None)
+        return
+
+    if action == "photo":
+        if not update.message.photo:
+            await update.message.reply_text("Please send a photo.")
+            return
+
+        value = update.message.photo[-1].file_id
+        column = "start_photo"
+
+    elif action == "message":
+        value = update.message.text
+        column = "start_message"
+
+    elif action == "about":
+        value = update.message.text
+        column = "about_text"
+
+    elif action == "broadcast":
+        value = update.message.text
+        context.user_data.pop("edit_action", None)
+        context.user_data.pop("editing_clone", None)
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM clone_users WHERE clone_id = %s",
+                    (clone_id,),
+                )
+                user_ids = [row[0] for row in cur.fetchall()]
+
+        # Broadcasting requires a running bot for this token.
+        await update.message.reply_text(
+            f"Broadcast prepared for {len(user_ids)} registered users. "
+            "The clone's polling worker must be active to send messages."
+        )
+        return
+
+    else:
+        return
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Column names are selected only from the fixed allowlist above.
+            cur.execute(
+                f"UPDATE clones SET {column} = %s WHERE id = %s",
+                (value, clone_id),
+            )
+        conn.commit()
+
+    context.user_data.pop("edit_action", None)
+    context.user_data.pop("editing_clone", None)
+
+    await update.message.reply_text("✅ Settings saved!")
+
+
+async def admin_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            users = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM clones")
+            clones = cur.fetchone()[0]
+
+    await update.message.reply_text(
+        f"🔐 Admin Panel\n\n"
+        f"Total users: {users}\n"
+        f"Registered clones: {clones}\n\n"
+        f"Use /broadcast <message> to broadcast to main-bot users."
+    )
+
+
+async def main_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    message = " ".join(context.args).strip()
+    if not message:
+        await update.message.reply_text(
+            "Usage: /broadcast Your message here"
+        )
+        return
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users")
+            user_ids = [row[0] for row in cur.fetchall()]
+
+    sent = 0
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(user_id, message)
+            sent += 1
+        except Exception:
+            logger.warning("Broadcast failed for user %s", user_id)
+
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        f"Broadcast finished.\nSent successfully: {sent}/{len(user_ids)}"
+    )
+
+
+async def buttons(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = query.data
+
+    if data == "home":
+        await query.answer()
+        await query.message.reply_text(
+            "Choose an option:",
+            reply_markup=main_keyboard(),
+        )
+
+    elif data == "about":
+        await about(update, context)
+
+    elif data in ("weather", "rain"):
+        await weather_callback(update, context)
+
+    elif data == "verify":
+        await verify_callback(update, context)
+
+    elif data == "create_clone":
+        await create_clone(update, context)
+
+    elif ":" in data:
+        await clone_settings(update, context)
+
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.
